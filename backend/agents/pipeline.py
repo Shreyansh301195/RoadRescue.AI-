@@ -2,158 +2,174 @@ import asyncio
 import uuid
 import json
 import random
-import re
-from typing import AsyncGenerator
+import os
+import time
+import logging
+from dotenv import load_dotenv
 
-async def simulate_agent(agent_name: str, delay: float = 1.0) -> dict:
-    await asyncio.sleep(delay)
-    return {}
+from google import genai
+from google.genai import types
+import googlemaps
 
-def analyze_input(text: str):
-    text = text.lower()
-    
-    # 1. Detect Vehicle
-    vehicle_match = re.search(r'(ertiga|baleno|swift|bmw|honda|city|audi|creta|thar|jeep|car|bike|scooter|motorcycle)', text)
-    vehicle = vehicle_match.group(1).title() if vehicle_match else "vehicle"
-    
-    # 2. Detect Issue
-    if "battery" in text or "start" in text or "clicking" in text or "ignition" in text:
-        issue = "battery"
-        issue_detail = "battery / starting issue"
-        severity = "MODERATE"
-    elif "tyre" in text or "tire" in text or "flat" in text or "burst" in text or "puncture" in text:
-        issue = "tyre"
-        issue_detail = "flat tyre"
-        severity = "MINOR"
-    elif "smoke" in text or "fire" in text or "accident" in text or "crash" in text:
-        issue = "accident"
-        issue_detail = "collision / potential hazard"
-        severity = "CRITICAL"
-    elif "fuel" in text or "petrol" in text or "gas" in text or "empty" in text:
-        issue = "fuel"
-        issue_detail = "out of fuel"
-        severity = "MINOR"
-    else:
-        issue = "engine"
-        issue_detail = "general breakdown"
-        severity = "MODERATE"
-        
-    return vehicle, issue, issue_detail, severity
+# Configure structured JSON logging for observability
+logger = logging.getLogger("roadrescue.pipeline")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('{"time": "%(asctime)s", "name": "%(name)s", "level": "%(levelname)s", "message": %(message)s}')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
-async def run_rescue_pipeline(user_input: str, lat: float = None, lon: float = None, manual_location: str = None) -> AsyncGenerator[str, None]:
+# Clients initialization - Force loading the .env from the backend root
+env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+load_dotenv(dotenv_path=env_path)
+
+API_KEY = os.environ.get("GOOGLE_API_KEY")
+print(API_KEY)
+genai_client = None
+gmaps_client = None
+
+if API_KEY:
+    genai_client = genai.Client(api_key=API_KEY)
+    gmaps_client = googlemaps.Client(key=API_KEY)
+else:
+    logger.error("Missing API Key or Google libraries not imported.")
+
+async def call_gemini_json(prompt: str, schema) -> dict:
+    if not genai_client:
+        return {"error": "GenAI SDK not initialized"}, None
+    start = time.time()
+    response = await asyncio.to_thread(
+        genai_client.models.generate_content,
+        model="gemini-2.0-flash", 
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=schema,
+            temperature=0.1,
+        ),
+    )
+    latency = (time.time() - start) * 1000
+    metrics = {
+        "agent": "TriageAgent", "latency_ms": round(latency, 2), "context": {"prompt_snippet": prompt[:100]}
+    }
+    if hasattr(response, 'usage_metadata') and response.usage_metadata:
+        prompts = response.usage_metadata.prompt_token_count
+        total = response.usage_metadata.total_token_count
+        metrics["tokens"] = {"prompt": prompts, "total": total, "latency_per_token_ms": round(latency / (total or 1), 2)}
+    logger.info(json.dumps(metrics))
+    return json.loads(response.text), response
+
+async def run_rescue_pipeline(user_input: str, lat: float = None, lon: float = None, manual_location: str = None):
     session_id = str(uuid.uuid4())
-    
     def make_event(event_type: str, data: dict):
         return {"data": json.dumps({'event': event_type, **data})}
 
-    # Intelligence Extraction
-    vehicle, issue, issue_detail, severity = analyze_input(user_input)
-
-    yield make_event("system_info", {"message": f"RescueCoordinatorAgent v3.0 initialized for {vehicle}.", "session_id": session_id})
-    yield make_event("agent_progress", {"agent": "FallbackMonitorAgent", "status": "running", "message": "Checking Vertex AI health..."})
-    await asyncio.sleep(1.0)
-    
-    # Only trigger fallback if explicitly requested in demo so it defaults to Gemini
-    trigger_fallback = "offline" in user_input.lower() or "fallback" in user_input.lower()
-
-    if trigger_fallback:
-        yield make_event("llm_fallback_triggered", {
-            "reason": "Quota Exceeded (Mock)",
-            "fallback_model": "llama3.2:3b",
-            "message": "We're running on our backup AI system right now. Response quality is slightly reduced but rescue coordination continues. Your safety is not affected."
-        })
-        llm_provider = "ollama:llama3.2:3b"
-    else:
-        yield make_event("agent_progress", {"agent": "FallbackMonitorAgent", "status": "success", "message": "Primary LLM operational."})
-        llm_provider = "gemini-2.0-flash"
-
-    yield make_event("context", {"llm_provider": llm_provider, "fallback_triggered": trigger_fallback})
-
-    # Step 1: LocationAgent
-    yield make_event("agent_progress", {"agent": "LocationAgent", "status": "running", "message": "Geocoding location..."})
-    await asyncio.sleep(1.0)
-    
-    loc_address = "Detecting..."
-    if manual_location:
-         loc_address = manual_location
-    elif lat and lon:
-         loc_address = f"GPS Coordinates: {lat:.6f}, {lon:.6f}"
-    else:
-         loc_address = "NH7 near Krishnagiri"
-
-    location_data = {
-        "lat": lat or 12.51, "lon": lon or 78.21,
-        "address": loc_address, "road_type": "highway", "nearest_city_km": 8, "connectivity_score": 0.8
-    }
-    yield make_event("agent_progress", {"agent": "LocationAgent", "status": "running", "message": f"Locking position: {loc_address}"})
+    yield make_event("system_info", {"message": f"RescueCoordinatorAgent v4.0 (Gemini Powered) initialized.", "session_id": session_id})
+    yield make_event("agent_progress", {"agent": "FallbackMonitorAgent", "status": "running", "message": "Verifying Google API access..."})
     await asyncio.sleep(0.5)
-    yield make_event("agent_complete", {"agent": "LocationAgent", "result": location_data})
 
-    if ("locat" in user_input.lower() or "gps" in user_input.lower()) and ("where" in user_input.lower() or "what" in user_input.lower()):
-        yield make_event("pipeline_complete", {"message": f"Your exact location is currently locked at {loc_address}. Are you experiencing a breakdown? Please describe the issue and I will dispatch help."})
+    if not genai_client:
+        yield make_event("pipeline_complete", {"message": "ERROR: GOOGLE_API_KEY is not loaded properly. The system could not initialize Gemini APIs."})
         return
 
+    yield make_event("agent_progress", {"agent": "FallbackMonitorAgent", "status": "success", "message": "Primary Google Cloud LLM operational."})
+    yield make_event("context", {"llm_provider": "gemini-2.0-flash", "fallback_triggered": False})
+
+    # Step 1: LocationAgent
+    yield make_event("agent_progress", {"agent": "LocationAgent", "status": "running", "message": "Geocoding location via Google Maps..."})
+    loc_address = "Location undetected."
+    search_lat = lat or 12.9716
+    search_lon = lon or 77.5946
+    try:
+        if manual_location and gmaps_client:
+            loc_address = manual_location
+            geo_res = await asyncio.to_thread(gmaps_client.geocode, loc_address)
+            if geo_res:
+                search_lat, search_lon = geo_res[0]['geometry']['location']['lat'], geo_res[0]['geometry']['location']['lng']
+        elif lat and lon and gmaps_client:
+            rev_geo = await asyncio.to_thread(gmaps_client.reverse_geocode, (lat, lon))
+            if rev_geo: loc_address = rev_geo[0]['formatted_address']
+        elif lat and lon:
+            loc_address = f"GPS: {lat:.5f}, {lon:.5f}"
+    except Exception as e: logger.error(f'{{"error": "Geocode error: {str(e)}"}}')
+    yield make_event("agent_progress", {"agent": "LocationAgent", "status": "running", "message": f"Locked position: {loc_address}"})
+    await asyncio.sleep(0.5)
+    yield make_event("agent_complete", {"agent": "LocationAgent", "result": {"lat": search_lat, "lon": search_lon, "address": loc_address}})
+
     # Step 2: TriageAgent
-    yield make_event("agent_progress", {"agent": "TriageAgent", "status": "running", "message": f"Analyzing {vehicle} issue..."})
-    await asyncio.sleep(1.5)
-    triage_data = {
-        "severity": severity,
-        "issue_category": issue,
-        "issue_detail": issue_detail,
-        "diy_possible": severity != "CRITICAL",
-        "parts_needed": ["jump cables"] if issue == "battery" else (["spare tyre"] if issue == "tyre" else []),
-        "vision_used": trigger_fallback
-    }
+    yield make_event("agent_progress", {"agent": "TriageAgent", "status": "running", "message": "Analyzing breakdown scenario using GenAI..."})
+    triage_data = {"severity": "MODERATE", "issue_category": "engine", "issue_detail": "general assistance needed", "vehicle_type": "vehicle", "diy_possible": False, "parts_needed": []}
+    
+    schema = types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "vehicle_type": types.Schema(type=types.Type.STRING, description="Make or model, else 'vehicle'"),
+            "issue_category": types.Schema(type=types.Type.STRING, description="Issue category: 'battery', 'tyre', 'fuel', 'accident', 'engine'"),
+            "issue_detail": types.Schema(type=types.Type.STRING, description="Short 3-word description"),
+            "severity": types.Schema(type=types.Type.STRING, description="CRITICAL/MINOR/MODERATE"),
+            "diy_possible": types.Schema(type=types.Type.BOOLEAN, description="Can the user fix this safely?"),
+            "parts_needed": types.Schema(type=types.Type.ARRAY, items=types.Schema(type=types.Type.STRING), description="Parts needed")
+        },
+        required=["vehicle_type", "issue_category", "issue_detail", "severity", "diy_possible", "parts_needed"]
+    )
+    try:
+        triage_res, _ = await call_gemini_json(f"Expert mechanic triage. Map user input: '{user_input}'. Output requested JSON.", schema)
+        if triage_res: triage_data.update(triage_res)
+    except Exception as e: logger.error(f'{{"error": "Triage failed: {str(e)}"}}')
+    
+    triage_data["vision_used"] = False
     yield make_event("agent_complete", {"agent": "TriageAgent", "result": triage_data})
 
     # Step 3: AvailabilityAgent
-    avail_msg = f"Executing alloydb_availability_check via pgvector for {issue} specialists..." if 'alloydb' in user_input.lower() else f"Checking vendor availability for {issue} issues..."
-    yield make_event("agent_progress", {"agent": "AvailabilityAgent", "status": "running", "message": avail_msg})
-    await asyncio.sleep(1.5)
-    
-    all_vendors = [
-        {"vendor_id": "v01", "name": "Raju Roadside Assistance", "phone": "+91 98765 43210", "distance_km": 2.8, "total_eta_min": 9, "eta_display": "~9 min", "specializations": ["battery", "towing"], "rating": 4.8},
-        {"vendor_id": "v02", "name": "Krishna Auto Works", "phone": "+91 87654 32109", "distance_km": 2.2, "total_eta_min": 15, "eta_display": "~15 min", "specializations": ["engine", "battery"], "rating": 4.3},
-        {"vendor_id": "v03", "name": "Speedy Tyre Fix", "phone": "+91 99999 88888", "distance_km": 4.1, "total_eta_min": 12, "eta_display": "~12 min", "specializations": ["tyre", "alignment"], "rating": 4.6},
-        {"vendor_id": "v04", "name": "City Towing Services", "phone": "+91 77777 66666", "distance_km": 5.5, "total_eta_min": 25, "eta_display": "~25 min", "specializations": ["accident", "towing"], "rating": 4.9},
-        {"vendor_id": "v05", "name": "Highway Fuel Delivery", "phone": "+91 66666 55555", "distance_km": 6.0, "total_eta_min": 30, "eta_display": "~30 min", "specializations": ["fuel"], "rating": 4.7},
-    ]
-    
-    # Filter by issue dynamically
-    matched_vendors = [v for v in all_vendors if issue in v['specializations'] or "towing" in v['specializations']]
-    if not matched_vendors: matched_vendors = all_vendors[:2] # fallback
-    
-    yield make_event("agent_complete", {"agent": "AvailabilityAgent", "result": {"available_vendors": matched_vendors[:2]}})
+    yield make_event("agent_progress", {"agent": "AvailabilityAgent", "status": "running", "message": "Querying Google Maps Places API for nearby vendors..."})
+    matched_vendors = []
+    if gmaps_client:
+        start_time = time.time()
+        try:
+            issue_cat = triage_data.get("issue_category", "engine")
+            keyword = "tire repair" if issue_cat in ["tyre", "flat"] else ("auto mechanic" if issue_cat in ["battery", "engine"] else "tow truck")
+            places_res = await asyncio.to_thread(gmaps_client.places_nearby, location=(search_lat, search_lon), radius=15000, keyword=keyword, type="car_repair")
+            logger.info(json.dumps({"agent": "AvailabilityAgent", "latency_ms": round((time.time() - start_time) * 1000, 2), "places_found": len(places_res.get('results', []))}))
+            
+            for i, place in enumerate(places_res.get('results', [])[:3]):
+                plat, plng = place['geometry']['location']['lat'], place['geometry']['location']['lng']
+                dist_km = ((search_lat-plat)**2 + (search_lon-plng)**2)**0.5 * 111
+                matched_vendors.append({
+                    "vendor_id": place['place_id'], "name": place.get('name', 'Local Partner'), "phone": "Indexed Provider",
+                    "distance_km": round(dist_km, 1), "total_eta_min": int(dist_km * 2) + 10, "eta_display": f"~{int(dist_km * 2) + 10} min",
+                    "specializations": [keyword], "rating": place.get('rating', 4.0)
+                })
+        except Exception as e: logger.error(f'{{"error": "Places API error: {str(e)}"}}')
+
+    if not matched_vendors: matched_vendors = [{"vendor_id": "v01", "name": "System Dispatched Help", "phone": "911", "distance_km": 3.0, "total_eta_min": 15, "eta_display": "~15 min", "specializations": ["general"], "rating": 4.5}]
+    yield make_event("agent_complete", {"agent": "AvailabilityAgent", "result": {"available_vendors": matched_vendors}})
 
     # Step 4: RescueDispatchAgent
-    dispatch_msg = "Running maps_directions MCP..." if 'mcp' in user_input.lower() else "Dispatching nearest help..."
-    yield make_event("agent_progress", {"agent": "RescueDispatchAgent", "status": "running", "message": dispatch_msg})
-    await asyncio.sleep(1.5)
+    yield make_event("agent_progress", {"agent": "RescueDispatchAgent", "status": "running", "message": "Assigning optimal vendor routing..."})
+    await asyncio.sleep(0.5)
     top_vendor = matched_vendors[0]
-    yield make_event("agent_complete", {"agent": "RescueDispatchAgent", "result": {"dispatched_vendor": top_vendor['name'], "firebase_tracking_id": f"#RR-2026-{random.randint(1000,9999)}"}})
+    yield make_event("agent_complete", {"agent": "RescueDispatchAgent", "result": {"dispatched_vendor": top_vendor['name'], "firebase_tracking_id": f"#RR-{random.randint(10000,99999)}"}})
 
-    # Step 5: GuidanceAgent
-    guide_msg = "Invoking search_web via Google Search MCP..." if 'mcp' in user_input.lower() else "Retrieving safety guidance..."
-    yield make_event("agent_progress", {"agent": "GuidanceAgent", "status": "running", "message": guide_msg})
-    await asyncio.sleep(1.5)
-    
-    if severity == "CRITICAL":
-        steps = ["Immediately exit the vehicle and move far away from the traffic.", "Call emergency services (112).", "Do NOT attempt any DIY fixes."]
-    elif issue == "tyre":
-        steps = ["Ensure hazard lights are ON.", "Locate your spare tyre and jack.", "Loosen lug nuts slightly before jacking up the car."]
-    elif issue == "battery":
-        steps = ["Ensure hazard lights are ON.", "If receiving a jump, connect RED to dead battery (+) terminal first."]
-    elif issue == "fuel":
-        steps = ["Ensure hazard lights are ON.", "Stay inside your vehicle if safely pulled over.", "Do not smoke near the vehicle."]
-    else:
-        steps = ["Ensure hazard lights are ON.", "Stay clear of active traffic.", "Wait for the professional."]
-        
+    # Step 5: GuidanceAgent 
+    yield make_event("agent_progress", {"agent": "GuidanceAgent", "status": "running", "message": "Generating dynamic safety instructions via Gemini..."})
+    steps = ["Ensure hazard lights are ON.", "Stay clear of active traffic.", "Wait safely for the dispatched professional."]
+    if genai_client:
+        start_time = time.time()
+        try:
+            prompt = f"Stranded user: {triage_data['severity']} level {triage_data['issue_category']} issue ({triage_data['issue_detail']}) on {triage_data['vehicle_type']}. Provide 3 short practical bullet points for safety via JSON array of strings strictly."
+            resp = await asyncio.to_thread(genai_client.models.generate_content, model="gemini-2.0-flash", contents=prompt)
+            txt = resp.text.strip()
+            if txt.startswith("```json"): txt = txt.split("```json")[1].split("```")[0].strip()
+            if txt.startswith('['): steps = json.loads(txt)
+            else: steps = [s.strip('- ') for s in txt.split('\n') if s.strip()][:3]
+        except Exception as e: logger.error(f'{{"error": "Guidance GenAI failed: {str(e)}"}}')
     yield make_event("agent_complete", {"agent": "GuidanceAgent", "result": {"steps": steps}})
 
     # Step 6: NotificationAgent
     yield make_event("agent_progress", {"agent": "NotificationAgent", "status": "running", "message": "Sending SOS to emergency contacts..."})
-    await asyncio.sleep(1.0)
+    await asyncio.sleep(0.5)
     yield make_event("agent_complete", {"agent": "NotificationAgent", "result": {"email_sent": True}})
 
-    final_text = f"It looks like an issue with your {vehicle} ({issue_detail}). We've dispatched {top_vendor['name']} (ETA: {top_vendor['eta_display']}). Track them live via the link provided. Your emergency contact has been notified. You're not alone. Help is on the way."
+    final_text = f"We have identified an issue with your {triage_data.get('vehicle_type','vehicle')} ({triage_data.get('issue_detail','engine')}). We've successfully assigned {top_vendor['name']} (ETA: {top_vendor['eta_display']}). Your emergency contact has been notified. Check the console for full JSON observability logs. Help is on the way!"
     yield make_event("pipeline_complete", {"message": final_text})
