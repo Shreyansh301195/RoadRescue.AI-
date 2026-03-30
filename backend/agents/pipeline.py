@@ -53,8 +53,8 @@ async def run_rescue_pipeline(user_input: str, lat: float = None, lon: float = N
     yield make_event("agent_progress", {"agent": "FallbackMonitorAgent", "status": "running", "message": "Checking Vertex AI health..."})
     await asyncio.sleep(1.0)
     
-    # Let's dynamically trigger fallback so the UI stays interesting
-    trigger_fallback = True
+    # Only trigger fallback if explicitly requested in demo so it defaults to Gemini
+    trigger_fallback = "offline" in user_input.lower() or "fallback" in user_input.lower()
 
     if trigger_fallback:
         yield make_event("llm_fallback_triggered", {
@@ -89,7 +89,7 @@ async def run_rescue_pipeline(user_input: str, lat: float = None, lon: float = N
     await asyncio.sleep(0.5)
     yield make_event("agent_complete", {"agent": "LocationAgent", "result": location_data})
 
-    if "location" in user_input.lower() and ("where" in user_input.lower() or "what" in user_input.lower()):
+    if ("locat" in user_input.lower() or "gps" in user_input.lower()) and ("where" in user_input.lower() or "what" in user_input.lower()):
         yield make_event("pipeline_complete", {"message": f"Your exact location is currently locked at {loc_address}. Are you experiencing a breakdown? Please describe the issue and I will dispatch help."})
         return
 

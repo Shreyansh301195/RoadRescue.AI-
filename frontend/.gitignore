@@ -22,3 +22,11 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+.vercel
+.env*.local
+
+*__pycache__
+*.pyc
+
+# Its so much hardcoded that even in production link it is not working
+# Why is it falling back and not using gemini. And why so vague answer
